@@ -1,12 +1,7 @@
-try {
-	await import('npm:ethers@6.10.0');
-	const crypto = await import('node:crypto');
-	const hash = crypto.createHash('sha256').update(secrets.SRC_JS, 'utf8').digest('hex');
-	if ('0x' + hash.toLowerCase() === args[0].toLowerCase()) {
-		return await eval(secrets.SRC_JS);
-	} else {
-		throw new Error(`0x${hash.toLowerCase()} != ${args[0].toLowerCase()}`);
-	}
-} catch (err) {
-	throw new Error(err.message.slice(0, 255));
-}
+await import('npm:ethers@6.10.0');
+const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secrets.SRC_JS));
+const hex = Array.from(new Uint8Array(h))
+	.map(b => ('0' + b.toString(16)).slice(-2))
+	.join('');
+if ('0x' + hex === args[0]) return await eval(secrets.SRC_JS);
+throw new Error(`0x${hex},${args[0]}`);
