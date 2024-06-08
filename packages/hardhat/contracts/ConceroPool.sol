@@ -28,10 +28,10 @@ error ConceroPool_InvalidAddress();
 ///@notice error emitted when the CCIP message sender is not allowed.
 error ConceroPool_SenderNotAllowed(address _sender);
 ///@notice error emitted when an attempt to create a new request is made while other is still active.
-error ConceroPool_ActivRequestNotFulfilledYet();
+error ConceroPool_PendingRequestNotFulfilledYet();
 ///@notice error emitted when an attempt to send value to a not allowed receiver is made
 error ConceroPool_DestinationNotAllowed();
-///@notice error emitted when the contract doesn't have enough link balance
+///@notice error emitted when the contract doesn't have enought link balance
 error ConceroPool_NotEnoughLinkBalance(uint256 linkBalance, uint256 fees);
 
 contract ConceroPool is CCIPReceiver, Ownable {
@@ -40,8 +40,7 @@ contract ConceroPool is CCIPReceiver, Ownable {
   struct WithdrawRequests {
     uint256 condition;
     uint256 amount;
-    bool isActiv;
-    bool isFulfilled;
+    bool isPending;
   }
 
   address public s_conceroOrchestrator;
@@ -254,45 +253,35 @@ contract ConceroPool is CCIPReceiver, Ownable {
 
     WithdrawRequests memory request = s_withdrawWaitlist[_token];
 
-    if (_token == address(0)) {
-      uint256 etherBalance = address(this).balance;
+    uint256 tokenAmount;
+    bool isNativeToken = _token == address(0);
+    if (isNativeToken) {
+      tokenAmount = address(this).balance;
+    } else {
+      tokenAmount = IERC20(_token).balanceOf(address(this));
+    }
 
-      if (request.isActiv) {
-        if (etherBalance >= request.condition) {
-          s_withdrawWaitlist[_token].isActiv = false;
-          s_withdrawWaitlist[_token].isFulfilled = true;
+    if (request.isPending) {
+      if (tokenAmount >= request.condition) {
+        s_withdrawWaitlist[_token].isPending = false;
 
+        if (isNativeToken) {
           _withdrawEther(_amount);
         } else {
-          revert ConceroPool_ActivRequestNotFulfilledYet();
+          _withdrawToken(_token, _amount);
         }
       } else {
-        if (_amount > (etherBalance * WITHDRAW_THRESHOLD) / 100) {
-          uint256 condition = (etherBalance - ((etherBalance * WITHDRAW_THRESHOLD) / 100)) + _amount;
-
-          s_withdrawWaitlist[_token] = WithdrawRequests({condition: condition, amount: _amount, isActiv: true, isFulfilled: false});
-          emit ConceroPool_WithdrawRequest(msg.sender, _token, condition, _amount); //CLF will listen to this.
-        } else {
-          _withdrawEther(_amount);
-        }
+        revert ConceroPool_PendingRequestNotFulfilledYet();
       }
     } else {
-      uint256 erc20Balance = IERC20(_token).balanceOf(address(this));
-      if (request.isActiv) {
-        if (erc20Balance >= request.condition) {
-          s_withdrawWaitlist[_token].isActiv = false;
-          s_withdrawWaitlist[_token].isFulfilled = true;
+      if (_amount > (tokenAmount * WITHDRAW_THRESHOLD) / 100) {
+        uint256 condition = (tokenAmount - ((tokenAmount * WITHDRAW_THRESHOLD) / 100)) + _amount;
 
-          _withdrawToken(_token, _amount);
-        } else {
-          revert ConceroPool_ActivRequestNotFulfilledYet();
-        }
+        s_withdrawWaitlist[_token] = WithdrawRequests({condition: condition, amount: _amount, isPending: true});
+        emit ConceroPool_WithdrawRequest(msg.sender, _token, condition, _amount); //CLF will listen to this.
       } else {
-        if (_amount > (erc20Balance * WITHDRAW_THRESHOLD) / 100) {
-          uint256 condition = (erc20Balance - ((erc20Balance * WITHDRAW_THRESHOLD) / 100)) + _amount;
-
-          s_withdrawWaitlist[_token] = WithdrawRequests({condition: condition, amount: _amount, isActiv: true, isFulfilled: false});
-          emit ConceroPool_WithdrawRequest(msg.sender, _token, condition, _amount); //CLF will listen to this.
+        if (isNativeToken) {
+          _withdrawEther(_amount);
         } else {
           _withdrawToken(_token, _amount);
         }
