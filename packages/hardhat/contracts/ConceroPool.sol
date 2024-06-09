@@ -4,7 +4,6 @@ pragma solidity 0.8.19;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
 import {IRouterClient} from "@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol";
@@ -43,9 +42,6 @@ contract ConceroPool is CCIPReceiver, Ownable {
     bool isPending;
   }
 
-  address public s_conceroOrchestrator;
-  address public s_messengerAddress;
-
   ///@notice removing magic-numbers
   uint256 private constant APPROVED = 1;
   ///@notice the maximum percentage a direct withdraw can take.
@@ -54,6 +50,7 @@ contract ConceroPool is CCIPReceiver, Ownable {
   LinkTokenInterface private immutable i_linkToken;
   ///@notice Chainlink CCIP Router
   IRouterClient private immutable i_router;
+  address public immutable i_conceroOrchestrator;
 
   ///@notice Mapping to keep track of allowed tokens ~ 1 == True
   mapping(address token => uint256 isApproved) public s_isTokenSupported;
@@ -67,6 +64,8 @@ contract ConceroPool is CCIPReceiver, Ownable {
   mapping(uint64 chainId => address pool) public s_poolReceiver;
   ///@notice Mapping to keep track of withdraw requests
   mapping(address token => WithdrawRequests) private s_withdrawWaitlist;
+  ///@notice address of the messenger addresses
+  mapping(address => uint256) private s_messengerAddresses;
 
   ////////////////////////////////////////////////////////
   //////////////////////// EVENTS ////////////////////////
@@ -74,8 +73,10 @@ contract ConceroPool is CCIPReceiver, Ownable {
 
   ///@notice event emitted when an Orchestrator is updated
   event ConceroPool_OrchestratorUpdated(address previousOrchestrator, address orchestrator);
-  ///@notice event emitted when a Messenger is updated
-  event ConceroPool_MessengerAddressUpdated(address previousMessenger, address messengerAddress);
+  ///@notice event emitted when a Messenger is added
+  event ConceroPool_MessengerAddressAdded(address messengerAddress);
+  ///@notice event emitted when a Messenger is removed
+  event ConceroPool_MessengerAddressRemoved(address messengerAddress);
   ///@notice event emitted when a supported token is added
   event ConceroPool_TokenSupportedUpdated(address token, uint256 isSupported);
   ///@notice event emitted when an approved sender is updated
@@ -117,9 +118,10 @@ contract ConceroPool is CCIPReceiver, Ownable {
     _;
   }
 
-  constructor(address _link, address _ccipRouter) CCIPReceiver(_ccipRouter) {
+  constructor(address _link, address _ccipRouter, address _conceroOrchestrator) CCIPReceiver(_ccipRouter) {
     i_linkToken = LinkTokenInterface(_link);
     i_router = IRouterClient(_ccipRouter);
+    i_conceroOrchestrator = _conceroOrchestrator;
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -130,30 +132,22 @@ contract ConceroPool is CCIPReceiver, Ownable {
   //////////////////////////////////
   ///onlyOwner EXTERNAL FUNCTIONS///
   //////////////////////////////////
-  /**
-   * @notice function to manage the Concero Orchestrator contract
-   * @param _orchestrator the address from the orchestrator
-   * @dev only owner can call it
-   * @dev it's payable to save some gas.
-   */
-  function setConceroOrchestrator(address _orchestrator) external payable onlyOwner {
-    address previousOrchestrator = s_conceroOrchestrator;
-
-    s_conceroOrchestrator = _orchestrator;
-
-    emit ConceroPool_OrchestratorUpdated(previousOrchestrator, _orchestrator);
-  }
 
   /**
    * @notice Function to update the messenger address
    * @param _messenger the address that will call some restrict functions
+   * @param _isAllowed 1 == True | Any other value == False
+   * @dev only owner can call it
+   * @dev it's payable to save some gas.
    */
-  function setMessenger(address _messenger) external payable onlyOwner {
-    address previousMessenger = s_messengerAddress;
+  function setMessenger(address _messenger, uint256 _isAllowed) external payable onlyOwner {
+    s_messengerAddresses[_messenger] = _isAllowed;
 
-    s_messengerAddress = _messenger;
-
-    emit ConceroPool_MessengerAddressUpdated(previousMessenger, s_messengerAddress);
+    if (_isAllowed == APPROVED) {
+      emit ConceroPool_MessengerAddressAdded(_messenger);
+    } else {
+      emit ConceroPool_MessengerAddressRemoved(_messenger);
+    }
   }
 
   /**
@@ -254,49 +248,36 @@ contract ConceroPool is CCIPReceiver, Ownable {
     WithdrawRequests memory request = s_withdrawWaitlist[_token];
 
     uint256 tokenAmount;
-    bool isNativeToken = _token == address(0);
-    if (isNativeToken) {
+    if (_token == address(0)) {
       tokenAmount = address(this).balance;
     } else {
       tokenAmount = IERC20(_token).balanceOf(address(this));
     }
 
     if (request.isPending) {
-      if (tokenAmount >= request.condition) {
-        s_withdrawWaitlist[_token].isPending = false;
+      if (tokenAmount < request.condition) revert ConceroPool_PendingRequestNotFulfilledYet();
 
-        if (isNativeToken) {
-          _withdrawEther(_amount);
-        } else {
-          _withdrawToken(_token, _amount);
-        }
-      } else {
-        revert ConceroPool_PendingRequestNotFulfilledYet();
-      }
+      s_withdrawWaitlist[_token].isPending = false;
+      _withdraw(_token, _amount);
     } else {
       if (_amount > (tokenAmount * WITHDRAW_THRESHOLD) / 100) {
         uint256 condition = (tokenAmount - ((tokenAmount * WITHDRAW_THRESHOLD) / 100)) + _amount;
-
         s_withdrawWaitlist[_token] = WithdrawRequests({condition: condition, amount: _amount, isPending: true});
         emit ConceroPool_WithdrawRequest(msg.sender, _token, condition, _amount); //CLF will listen to this.
       } else {
-        if (isNativeToken) {
-          _withdrawEther(_amount);
-        } else {
-          _withdrawToken(_token, _amount);
-        }
+        _withdraw(_token, _amount);
       }
     }
   }
 
   /**
-   * @notice Function to Distribute Liquidity accross Concero Pools
+   * @notice Function to Distribute Liquidity across Concero Pools
    * @param _destinationChainSelector Chain Id of the chain that will receive the amount
    * @param _token  address of the token to be sent
    * @param _amount amount of the token to be sent
    */
   function ccipSendToPool(uint64 _destinationChainSelector, address _token, uint256 _amount) external returns (bytes32 messageId) {
-    if (msg.sender != s_messengerAddress) revert ConceroPool_Unauthorized();
+    if (s_messengerAddresses[msg.sender] != APPROVED) revert ConceroPool_Unauthorized();
 
     if (s_poolReceiver[_destinationChainSelector] == address(0)) revert ConceroPool_DestinationNotAllowed();
 
@@ -335,7 +316,7 @@ contract ConceroPool is CCIPReceiver, Ownable {
    * @dev for ether transfer, the _receiver need to be known and trusted
    */
   function orchestratorLoan(address _token, uint256 _amount, address _receiver) external {
-    if (msg.sender != s_conceroOrchestrator) revert ConceroPool_ItsNotAnOrchestrator(msg.sender);
+    if (msg.sender != i_conceroOrchestrator) revert ConceroPool_ItsNotAnOrchestrator(msg.sender);
     if (_receiver == address(0)) revert ConceroPool_InvalidAddress();
 
     if (_token == address(0)) {
@@ -384,37 +365,30 @@ contract ConceroPool is CCIPReceiver, Ownable {
   ///////////////
   /// PRIVATE ///
   ///////////////
-  /**
-   * @notice function to withdraw Ether
-   * @param _amount the ether amout to withdraw
-   * @dev The address(0) is hardcode as ether
-   * @dev this is a private function that can only be called throught `withdrawLiquidityRequest`
-   */
-  function _withdrawEther(uint256 _amount) private onlyApprovedSender(address(0)) {
-    if (_amount > s_userBalances[address(0)][msg.sender] || _amount > address(this).balance) revert ConceroPool_InsufficientBalance();
-
-    s_userBalances[address(0)][msg.sender] = s_userBalances[address(0)][msg.sender] - _amount;
-
-    emit ConceroPool_Withdrawn(msg.sender, address(0), _amount);
-
-    (bool sent, ) = msg.sender.call{value: _amount}("");
-    if (!sent) revert ConceroPool_TransferFailed();
-  }
 
   /**
-   * @notice function to withdraw ERC20 tokens from the pool
+   * @notice function to withdraw ERC20 or native tokens from the pool
    * @param _token address of the token to be withdraw
    * @param _amount the total amount to be withdraw
    * @dev this is a private function that can only be called throught `withdrawLiquidityRequest`
    */
-  function _withdrawToken(address _token, uint256 _amount) private onlyApprovedSender(_token) {
-    if (_amount > IERC20(_token).balanceOf(address(this))) revert ConceroPool_InsufficientBalance();
+  function _withdraw(address _token, uint256 _amount) private onlyApprovedSender(_token) {
+    bool isNativeToken = _token == address(0);
+    if (isNativeToken) {
+      if (_amount > s_userBalances[address(0)][msg.sender] || _amount > address(this).balance) revert ConceroPool_InsufficientBalance();
+    } else {
+      if (_amount > IERC20(_token).balanceOf(address(this))) revert ConceroPool_InsufficientBalance();
+    }
 
     s_userBalances[_token][msg.sender] = s_userBalances[_token][msg.sender] - _amount;
-
     emit ConceroPool_Withdrawn(msg.sender, _token, _amount);
 
-    IERC20(_token).safeTransfer(msg.sender, _amount);
+    if (isNativeToken) {
+      (bool sent, ) = msg.sender.call{value: _amount}("");
+      if (!sent) revert ConceroPool_TransferFailed();
+    } else {
+      IERC20(_token).safeTransfer(msg.sender, _amount);
+    }
   }
 
   ///////////////////////////
